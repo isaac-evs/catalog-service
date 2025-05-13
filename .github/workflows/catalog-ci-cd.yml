@@ -1,4 +1,4 @@
-name: Catalog Service CI/CD
+name: Catalog Service CI/CD (Enhanced)
 
 on:
   push:
@@ -48,15 +48,29 @@ jobs:
         uses: aws-actions/amazon-ecr-login@v1
 
       - name: Build, tag, and push image to Amazon ECR
+        id: build-image
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY_CATALOG }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
+          # Print diagnostics
+          echo "Building image for repository: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+          # Build Docker image
           docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
+
+          # Print image details
+          echo "Image built successfully:"
+          docker images | grep $ECR_REPOSITORY
+
+          # Push to ECR
+          echo "Pushing to ECR..."
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
-          echo "::set-output name=image::$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+          # Set output for next job
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
 
   deploy:
     name: Deploy to EC2
@@ -64,24 +78,70 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Deploy to EC2
+      - name: EC2 Instance Status Check
         uses: appleboy/ssh-action@master
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USERNAME }}
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
-            # Login to Amazon ECR
-            aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+            echo "=== EC2 Readiness Check ==="
+            echo "Hostname: $(hostname)"
+            echo "Docker Status: $(systemctl is-active docker)"
+            echo "Available Disk Space: $(df -h | grep /dev/root)"
+            echo "Available Memory: $(free -h | grep Mem | awk '{print $4}')"
+            echo "AWS CLI Version: $(aws --version)"
 
-            # Pull the latest image
-            docker pull ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_REPOSITORY_CATALOG }}:latest
+      - name: Deploy to EC2 with Debug
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            set -e  # Exit immediately if any command fails
+
+            echo "=== Starting Deployment ==="
+
+            # Create a timestamped deployment log
+            DEPLOY_LOG="/home/${{ secrets.EC2_USERNAME }}/deployment_$(date +%Y%m%d_%H%M%S).log"
+            exec > >(tee -a ${DEPLOY_LOG}) 2>&1
+
+            echo "Deployment started at $(date)"
+
+            # Echo important variables
+            echo "AWS Account: ${{ secrets.AWS_ACCOUNT_ID }}"
+            echo "AWS Region: ${{ secrets.AWS_REGION }}"
+            echo "ECR Repository: ${{ secrets.ECR_REPOSITORY_CATALOG }}"
+
+            # Login to Amazon ECR with detailed error logging
+            echo "Logging in to Amazon ECR..."
+            if ! aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com; then
+              echo "ERROR: Failed to log in to ECR"
+              exit 1
+            fi
+            echo "ECR login successful"
+
+            # Pull the latest image with detailed error logging
+            echo "Pulling the latest image..."
+            FULL_IMAGE_NAME="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_REPOSITORY_CATALOG }}:latest"
+            echo "Full image name: $FULL_IMAGE_NAME"
+
+            if ! docker pull $FULL_IMAGE_NAME; then
+              echo "ERROR: Failed to pull image from ECR"
+              echo "Checking if repository exists..."
+              aws ecr describe-repositories --repository-names ${{ secrets.ECR_REPOSITORY_CATALOG }} || echo "Repository not found"
+              exit 1
+            fi
+            echo "Image pull successful"
 
             # Stop and remove the existing container if it exists
-            docker stop catalog-service || true
-            docker rm catalog-service || true
+            echo "Stopping existing container if it exists..."
+            docker stop catalog-service 2>/dev/null || echo "No container to stop"
+            docker rm catalog-service 2>/dev/null || echo "No container to remove"
 
             # Create .env file
+            echo "Creating environment file..."
             cat > .env.catalog << EOL
             DB_HOST=${{ secrets.DB_HOST }}
             DB_PORT=${{ secrets.DB_PORT }}
@@ -91,13 +151,38 @@ jobs:
             API_HOST=0.0.0.0
             API_PORT=8000
             EOL
+            echo "Environment file created"
 
             # Run the new container
-            docker run -d --name catalog-service \
+            echo "Starting the container..."
+            if ! docker run -d --name catalog-service \
               --restart always \
               -p 8000:8000 \
               --env-file .env.catalog \
-              ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_REPOSITORY_CATALOG }}:latest
+              $FULL_IMAGE_NAME; then
+              echo "ERROR: Failed to start container"
+              exit 1
+            fi
+            echo "Container started successfully"
+
+            # Verify container is running
+            echo "Verifying container status..."
+            if ! docker ps | grep catalog-service; then
+              echo "ERROR: Container not running"
+              echo "Container logs:"
+              docker logs catalog-service
+              exit 1
+            fi
+            echo "Container is running properly"
 
             # Clean up old images
+            echo "Cleaning up old images..."
             docker image prune -af
+
+            echo "Deployment completed successfully at $(date)"
+
+            # Test endpoint
+            echo "Testing API endpoint..."
+            curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/ || echo "Endpoint not responding"
+
+            echo "=== Deployment Completed ==="
