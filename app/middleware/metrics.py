@@ -13,7 +13,7 @@ logger = logging.getLogger("catalog_service")
 class CloudWatchMetricsMiddleware(BaseHTTPMiddleware):
     def __init__(self, app):
         super().__init__(app)
-        self.environment = os.getenv("ENVIRONMENT", "development")
+        self.environment = os.getenv("ENVIRONMENT", "production")
         self.service_name = "catalog-service"
 
         # Initialize CloudWatch client only in production environment
