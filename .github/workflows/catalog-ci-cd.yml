@@ -2,119 +2,130 @@ name: Catalog Service CI/CD
 
 on:
   push:
-    branches: [main]
+    branches: [ main ]
   pull_request:
-    branches: [main]
+    branches: [ main ]
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v2
+    - uses: actions/checkout@v2
 
-      - name: Set up Python
-        uses: actions/setup-python@v2
-        with:
-          python-version: "3.9"
+    - name: Set up Python
+      uses: actions/setup-python@v2
+      with:
+        python-version: '3.9'
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
   package:
     needs: build
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v2
+    - uses: actions/checkout@v2
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v1
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v1
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
 
-      - name: Build, tag, and push image to Amazon ECR
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY_CATALOG }}
-          IMAGE_TAG: ${{ github.sha }}
-        run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+    - name: Build, tag, and push image to Amazon ECR
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY_CATALOG }}
+        IMAGE_TAG: ${{ github.sha }}
+      run: |
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
   deploy:
     needs: package
     runs-on: ubuntu-latest
 
     steps:
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v1
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v1
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
 
-      - name: Deploy to EC2
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY_CATALOG }}
-          IMAGE_TAG: ${{ github.sha }}
-          EC2_HOST: ${{ secrets.EC2_HOST }}
-          EC2_USERNAME: ${{ secrets.EC2_USERNAME }}
-          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
-        run: |
-          # Write the SSH key to a file
-          echo "$EC2_SSH_KEY" > ssh_key.pem
-          chmod 600 ssh_key.pem
+    - name: Deploy to EC2
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY_CATALOG }}
+        IMAGE_TAG: ${{ github.sha }}
+        EC2_HOST: ${{ secrets.EC2_HOST }}
+        EC2_USERNAME: ${{ secrets.EC2_USERNAME }}
+        EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+      run: |
+        # Write the SSH key to a file
+        echo "$EC2_SSH_KEY" > ssh_key.pem
+        chmod 600 ssh_key.pem
 
-          # Define the variables directly in the deployment script to avoid variable substitution issues
-          REGISTRY=$ECR_REGISTRY
-          REPO=$ECR_REPOSITORY
-          TAG=$IMAGE_TAG
-
-          # Create deployment script that properly handles variables
-          cat > deploy.sh << EOF
-          #!/bin/bash
-
-          # Stop and remove the old container if it exists
-          docker stop catalog-service || true
-          docker rm catalog-service || true
-
-          # Pull the new image
-          docker pull ${REGISTRY}/${REPO}:${TAG}
-
-          # Ensure environment file exists
-          if [ ! -f /home/$EC2_USERNAME/catalog-service.env ]; then
-            echo "Creating empty environment file"
-            touch /home/$EC2_USERNAME/catalog-service.env
+        # Create the environment file if it doesn't exist
+        ssh -i ssh_key.pem -o StrictHostKeyChecking=no ${EC2_USERNAME}@${EC2_HOST} "
+          if [ ! -f /home/${EC2_USERNAME}/catalog-service.env ]; then
+            echo 'DB_HOST=${{ secrets.DB_HOST }}' > /home/${EC2_USERNAME}/catalog-service.env
+            echo 'DB_PORT=${{ secrets.DB_PORT }}' >> /home/${EC2_USERNAME}/catalog-service.env
+            echo 'DB_NAME=${{ secrets.DB_NAME }}' >> /home/${EC2_USERNAME}/catalog-service.env
+            echo 'DB_USER=${{ secrets.DB_USER }}' >> /home/${EC2_USERNAME}/catalog-service.env
+            echo 'DB_PASSWORD=${{ secrets.DB_PASSWORD }}' >> /home/${EC2_USERNAME}/catalog-service.env
+            echo 'API_HOST=0.0.0.0' >> /home/${EC2_USERNAME}/catalog-service.env
+            echo 'API_PORT=8000' >> /home/${EC2_USERNAME}/catalog-service.env
           fi
+        "
 
-          # Run the new container
-          docker run -d \\
-            --name catalog-service \\
-            -p 8000:8000 \\
-            --restart always \\
-            --env-file /home/$EC2_USERNAME/catalog-service.env \\
-            ${REGISTRY}/${REPO}:${TAG}
-          EOF
+        # Create deployment script
+        cat > deploy.sh << EOL
+#!/bin/bash
 
-          # Copy the deployment script to the EC2 instance
-          scp -i ssh_key.pem -o StrictHostKeyChecking=no deploy.sh ${EC2_USERNAME}@${EC2_HOST}:/home/${EC2_USERNAME}/
+# Full image path
+FULL_IMAGE_PATH="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+echo "Deploying image: \$FULL_IMAGE_PATH"
 
-          # Execute the deployment script
-          ssh -i ssh_key.pem -o StrictHostKeyChecking=no ${EC2_USERNAME}@${EC2_HOST} "chmod +x /home/${EC2_USERNAME}/deploy.sh && /home/${EC2_USERNAME}/deploy.sh"
+# Stop and remove the old container if it exists
+echo "Stopping old container..."
+docker stop catalog-service || echo "No container to stop"
+docker rm catalog-service || echo "No container to remove"
 
-          # Clean up
-          rm ssh_key.pem deploy.sh
+# Pull the new image
+echo "Pulling new image..."
+docker pull \$FULL_IMAGE_PATH
+
+# Run the new container
+echo "Starting new container..."
+docker run -d \\
+  --name catalog-service \\
+  -p 8000:8000 \\
+  --restart always \\
+  --env-file /home/${EC2_USERNAME}/catalog-service.env \\
+  \$FULL_IMAGE_PATH
+
+echo "Deployment completed"
+EOL
+
+        # Copy the deployment script to the EC2 instance
+        scp -i ssh_key.pem -o StrictHostKeyChecking=no deploy.sh ${EC2_USERNAME}@${EC2_HOST}:/home/${EC2_USERNAME}/
+
+        # Execute the deployment script
+        ssh -i ssh_key.pem -o StrictHostKeyChecking=no ${EC2_USERNAME}@${EC2_HOST} "chmod +x /home/${EC2_USERNAME}/deploy.sh && /home/${EC2_USERNAME}/deploy.sh"
+
+        # Clean up
+        rm ssh_key.pem deploy.sh
